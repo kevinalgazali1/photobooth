@@ -7,8 +7,8 @@ import "@fontsource/figtree/latin-700";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Booth Berdua",
-  description: "Photobooth online untuk dua orang di kota yang berbeda. Foto bareng, unduh strip-nya.",
+  title: "Booth Bareng",
+  description: "Photobooth online untuk 1–8 orang di kota yang berbeda. Foto bareng teman, unduh strip-nya.",
 };
 
 export const viewport: Viewport = {

@@ -3,15 +3,19 @@
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import { generateRoomCode, normalizeRoomCode } from "@/lib/room";
+import { DEFAULT_CAPACITY, MAX_CAPACITY, MIN_CAPACITY, parseCapacity } from "@/lib/types";
+
+const SIZES = Array.from({ length: MAX_CAPACITY - MIN_CAPACITY + 1 }, (_, i) => MIN_CAPACITY + i);
 
 export function StartForm() {
   const router = useRouter();
+  const [people, setPeople] = useState(DEFAULT_CAPACITY);
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
 
   const createRoom = () => {
     setBusy(true);
-    router.push(`/room/${generateRoomCode()}`);
+    router.push(`/room/${generateRoomCode()}?n=${people}`);
   };
 
   const joinRoom = (event: FormEvent) => {
@@ -19,11 +23,36 @@ export function StartForm() {
     const normalized = normalizeRoomCode(code);
     if (!normalized) return;
     setBusy(true);
-    router.push(`/room/${normalized}`);
+    // Kalau yang ditempel tautan lengkap, kapasitasnya ikut dibawa. Kode saja: ikut kapasitas room.
+    const n = parseCapacity(code.match(/[?&]n=(\d+)/)?.[1]);
+    router.push(`/room/${normalized}${n ? `?n=${n}` : ""}`);
   };
 
   return (
     <div className="flex flex-col gap-5">
+      <div className="flex flex-col gap-2.5" role="group" aria-labelledby="people-label">
+        <span id="people-label" className="text-sm font-bold text-paper/90">
+          Berapa orang?
+        </span>
+        <div className="flex flex-wrap gap-2">
+          {SIZES.map((n) => (
+            <button
+              key={n}
+              type="button"
+              aria-pressed={people === n}
+              aria-label={`${n} orang`}
+              onClick={() => setPeople(n)}
+              className="h-11 w-11 rounded-full border-2 border-paper/40 font-display text-xl font-bold transition-colors hover:border-paper aria-pressed:border-flash aria-pressed:bg-flash aria-pressed:text-ink"
+            >
+              {n}
+            </button>
+          ))}
+        </div>
+        <span className="text-xs text-paper/65">
+          {people === 1 ? "Foto sendiri, tanpa menunggu siapa pun." : `Kamu dan ${people - 1} teman.`}
+        </span>
+      </div>
+
       <button
         type="button"
         onClick={createRoom}
@@ -35,7 +64,7 @@ export function StartForm() {
 
       <form onSubmit={joinRoom} className="flex max-w-sm flex-col gap-2">
         <label htmlFor="room-code" className="text-sm text-paper/80">
-          Sudah dapat kode atau tautan dari pasanganmu?
+          Sudah dapat kode atau tautan dari temanmu?
         </label>
         <div className="flex gap-2">
           <input

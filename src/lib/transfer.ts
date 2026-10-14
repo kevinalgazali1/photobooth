@@ -16,11 +16,13 @@ export type PhotoMeta = {
 
 function waitForDrain(dc: RTCDataChannel): Promise<void> {
   return new Promise((resolve) => {
-    const onLow = () => {
-      dc.removeEventListener("bufferedamountlow", onLow);
+    const done = () => {
+      dc.removeEventListener("bufferedamountlow", done);
+      dc.removeEventListener("close", done);
       resolve();
     };
-    dc.addEventListener("bufferedamountlow", onLow);
+    dc.addEventListener("bufferedamountlow", done);
+    dc.addEventListener("close", done); // jangan menggantung antrean kalau peer keluar
   });
 }
 

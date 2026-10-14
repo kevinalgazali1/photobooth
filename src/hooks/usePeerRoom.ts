@@ -4,22 +4,62 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 import { getSupabase } from "@/lib/supabase";
 import { createReceiver, sendBlob, type PhotoMeta } from "@/lib/transfer";
-import type {
-  BoothMessage,
-  ConnectionStatus,
-  SignalEnvelope,
-  SignalPayload,
+import {
+  DEFAULT_CAPACITY,
+  MAX_CAPACITY,
+  parseCapacity,
+  type BoothMessage,
+  type ConnectionStatus,
+  type SignalEnvelope,
+  type SignalPayload,
 } from "@/lib/types";
 
 type Handlers = {
-  onMessage: (message: BoothMessage) => void;
-  onPhoto: (index: number, blob: Blob) => void;
+  onMessage: (from: string, message: BoothMessage) => void;
+  onPhoto: (from: string, index: number, blob: Blob) => void;
+  /** Data channel ke `peerId` baru terbuka (tempat yang pas untuk mengirim pengaturan). */
+  onChannelOpen: (peerId: string) => void;
 };
 
-type PresenceMeta = { id: string; joinedAt: number };
+type PresenceMeta = { id: string; joinedAt: number; capacity?: number; admitted: boolean };
+
+/** Ringkasan satu peer untuk UI. */
+export type PeerView = { id: string; stream: MediaStream | null; connected: boolean; channelOpen: boolean };
+
+/** State per pasangan (aku ↔ peer) di topologi mesh. */
+type Peer = {
+  id: string;
+  pc: RTCPeerConnection;
+  /** Yang id-nya lebih kecil membuat offer. */
+  initiator: boolean;
+  dc: RTCDataChannel | null;
+  /** Kandidat ICE masuk yang menunggu remote description. */
+  pendingRemote: RTCIceCandidateInit[];
+  /** Kandidat ICE keluar yang menunggu dikirim per batch. */
+  outgoing: RTCIceCandidateInit[];
+  flushTimer: ReturnType<typeof setTimeout> | null;
+  stream: MediaStream | null;
+  connected: boolean;
+  /** Sudah pernah terlihat di presence (supaya peer yang offer-nya datang lebih dulu tidak langsung ditutup). */
+  seen: boolean;
+  /** Antrean kirim foto, agar potongan dua foto tidak tercampur di satu data channel. */
+  sendQueue: Promise<void>;
+};
+
+type Stage = "media" | "joining" | "admitted" | "full" | "error";
 
 const FALLBACK_ICE: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
-const MAX_MEMBERS = 2;
+/** Waktu tunggu setelah subscribe sebelum menghitung slot, supaya presence anggota lain sudah terlihat. */
+const ADMIT_DELAY_MS = 700;
+/** Jarak antar pesan broadcast agar burst signaling 8 orang tidak kena rate limit Realtime. */
+const SIGNAL_SPACING_MS = 40;
+const CANDIDATE_BATCH_MS = 200;
+/** Peer yang hilang dari presence tapi koneksinya masih hidup diberi waktu sebentar (mungkin cuma reconnect). */
+const LEAVE_GRACE_MS = 4000;
+
+const BITRATE_BUDGET = 1_500_000;
+const BITRATE_MIN = 150_000;
+const BITRATE_MAX = 1_200_000;
 
 function describeMediaError(err: unknown): string {
   if (err instanceof DOMException) {
@@ -33,23 +73,69 @@ function describeMediaError(err: unknown): string {
   return err instanceof Error ? err.message : "Terjadi kesalahan yang tidak diketahui.";
 }
 
+const CAMERA_CONSTRAINTS: MediaStreamConstraints = {
+  video: {
+    facingMode: "user",
+    width: { ideal: 1280 },
+    height: { ideal: 960 },
+    aspectRatio: { ideal: 4 / 3 },
+  },
+  audio: { echoCancellation: true, noiseSuppression: true },
+};
+
+let cameraQueue: Promise<unknown> = Promise.resolve();
+
+/**
+ * Permintaan kamera dijalankan satu per satu. Dua getUserMedia yang tumpang tindih
+ * (mis. effect yang dipasang dua kali di Strict Mode) bisa membuat yang kedua gagal.
+ * Permintaan yang sudah dibatalkan dilewati, dan kamera yang telanjur terbuka langsung dimatikan.
+ * Kegagalan sementara (kamera masih dilepas) dicoba lagi sebentar.
+ */
+function openCamera(isCancelled: () => boolean): Promise<MediaStream | null> {
+  const run = cameraQueue.then(async () => {
+    for (let attempt = 0; ; attempt++) {
+      if (isCancelled()) return null;
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(CAMERA_CONSTRAINTS);
+        if (isCancelled()) {
+          stream.getTracks().forEach((t) => t.stop());
+          return null;
+        }
+        return stream;
+      } catch (err) {
+        const transient = err instanceof DOMException && ["NotReadableError", "AbortError"].includes(err.name);
+        if (!transient || attempt >= 2) throw err;
+        await new Promise((r) => setTimeout(r, 600));
+      }
+    }
+  });
+  cameraQueue = run.catch(() => undefined);
+  return run;
+}
+
+const byJoin =(a: { joinedAt: number; id: string }, b: { joinedAt: number; id: string }) =>
+  a.joinedAt - b.joinedAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
 /**
  * Mengatur seluruh koneksi untuk satu room:
- * kamera lokal → Supabase Realtime (presence + signaling) → RTCPeerConnection + data channel.
+ * kamera lokal → Supabase Realtime (presence + signaling) → satu RTCPeerConnection + data channel per teman.
+ *
+ * @param capacityParam kapasitas dari tautan (`?n=`), null bila masuk lewat kode saja.
  */
-export function usePeerRoom(roomId: string, handlers: Handlers) {
-  const [status, setStatus] = useState<ConnectionStatus>("media");
+export function usePeerRoom(roomId: string, capacityParam: number | null, handlers: Handlers) {
+  const [stage, setStage] = useState<Stage>("media");
   const [error, setError] = useState<string | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
-  const [isInitiator, setIsInitiator] = useState(false);
-  const [channelOpen, setChannelOpen] = useState(false);
+  const [myId, setMyId] = useState<string | null>(null);
+  const [capacity, setCapacity] = useState<number | null>(null);
+  /** Anggota yang sudah admitted (termasuk aku), urut joinedAt lalu id. Sama di semua layar. */
+  const [members, setMembers] = useState<string[]>([]);
+  const [peers, setPeers] = useState<Record<string, PeerView>>({});
   const [micOn, setMicOn] = useState(true);
 
   const handlersRef = useRef(handlers);
-  const dcRef = useRef<RTCDataChannel | null>(null);
+  const peersRef = useRef<Map<string, Peer>>(new Map());
   const localRef = useRef<MediaStream | null>(null);
-  const sendQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     handlersRef.current = handlers;
@@ -57,132 +143,233 @@ export function usePeerRoom(roomId: string, handlers: Handlers) {
 
   useEffect(() => {
     let cancelled = false;
-    const myId = crypto.randomUUID();
+    const id = crypto.randomUUID();
+    const joinedAt = Date.now();
+    const peerMap = new Map<string, Peer>();
+    peersRef.current = peerMap;
 
     let channel: RealtimeChannel | null = null;
-    let pc: RTCPeerConnection | null = null;
-    let peerId: string | null = null;
-    let connected = false;
     let iceServers: RTCIceServer[] = FALLBACK_ICE;
-    let pendingRemote: RTCIceCandidateInit[] = [];
-    let outgoing: RTCIceCandidateInit[] = [];
-    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    let admitted = false;
+    let admitReady = false;
+    let finished = false; // full / unmount
+    let roomCapacity: number | null = null;
+    let present = new Set<string>();
+    let membersKey = "";
+    const earlyCandidates = new Map<string, RTCIceCandidateInit[]>();
+    const timers = new Set<ReturnType<typeof setTimeout>>();
 
-    const signal = (payload: SignalPayload) => {
-      if (!channel) return;
-      const envelope: SignalEnvelope = { ...payload, from: myId, to: peerId };
-      void channel.send({ type: "broadcast", event: "signal", payload: envelope });
+    const later = (fn: () => void, ms: number) => {
+      const t = setTimeout(() => {
+        timers.delete(t);
+        fn();
+      }, ms);
+      timers.add(t);
     };
 
-    // Kandidat ICE dikumpulkan lalu dikirim per batch supaya tidak kena rate limit Realtime.
-    const flushCandidates = () => {
-      flushTimer = null;
-      if (outgoing.length === 0) return;
-      signal({ type: "candidates", candidates: outgoing });
-      outgoing = [];
+    // ── Signaling keluar (dibatasi lajunya) ─────────────────────
+    const outbox: SignalEnvelope[] = [];
+    let outboxTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const pumpOutbox = () => {
+      const next = outbox.shift();
+      if (!next) {
+        outboxTimer = null;
+        return;
+      }
+      if (channel) void channel.send({ type: "broadcast", event: "signal", payload: next });
+      outboxTimer = setTimeout(pumpOutbox, SIGNAL_SPACING_MS);
     };
 
-    const setupDataChannel = (dc: RTCDataChannel) => {
-      dc.binaryType = "arraybuffer";
-      dcRef.current = dc;
-      const receiver = createReceiver((index, blob) => handlersRef.current.onPhoto(index, blob));
+    const signal = (to: string, payload: SignalPayload) => {
+      outbox.push({ ...payload, from: id, to });
+      if (!outboxTimer) pumpOutbox();
+    };
 
-      dc.onopen = () => setChannelOpen(true);
-      dc.onclose = () => {
-        if (dcRef.current === dc) {
-          dcRef.current = null;
-          setChannelOpen(false);
+    // ── State untuk UI ──────────────────────────────────────────
+    const publish = () => {
+      if (cancelled) return;
+      const views: Record<string, PeerView> = {};
+      for (const p of peerMap.values()) {
+        views[p.id] = {
+          id: p.id,
+          stream: p.stream,
+          connected: p.connected,
+          channelOpen: p.dc?.readyState === "open",
+        };
+      }
+      setPeers(views);
+    };
+
+    /** Bitrate video dibagi rata ke semua peer; resolusi kirim diturunkan untuk ≥4 orang. */
+    const tuneVideo = () => {
+      const count = Math.max(1, peerMap.size);
+      const maxBitrate = Math.round(Math.min(BITRATE_MAX, Math.max(BITRATE_MIN, BITRATE_BUDGET / count)));
+      const scaleResolutionDownBy = peerMap.size + 1 >= 4 ? 2 : 1;
+      for (const p of peerMap.values()) {
+        if (p.pc.connectionState !== "connected") continue;
+        for (const sender of p.pc.getSenders()) {
+          if (sender.track?.kind !== "video") continue;
+          const params = sender.getParameters();
+          if (!params.encodings?.length) continue;
+          params.encodings[0].maxBitrate = maxBitrate;
+          params.encodings[0].scaleResolutionDownBy = scaleResolutionDownBy;
+          sender.setParameters(params).catch((err) => console.warn("[bitrate]", err));
         }
+      }
+    };
+
+    // ── Per peer ────────────────────────────────────────────────
+    const closePeer = (peerId: string) => {
+      const peer = peerMap.get(peerId);
+      if (!peer) return;
+      peerMap.delete(peerId);
+      if (peer.flushTimer) clearTimeout(peer.flushTimer);
+      if (peer.dc) {
+        peer.dc.onopen = null;
+        peer.dc.onclose = null;
+        peer.dc.onmessage = null;
+      }
+      peer.pc.onicecandidate = null;
+      peer.pc.ontrack = null;
+      peer.pc.onconnectionstatechange = null;
+      peer.pc.ondatachannel = null;
+      peer.pc.close();
+      for (let i = outbox.length - 1; i >= 0; i--) if (outbox[i].to === peerId) outbox.splice(i, 1);
+      earlyCandidates.delete(peerId);
+      publish();
+      tuneVideo();
+    };
+
+    /** Tutup peer yang sudah keluar dari presence, kecuali koneksinya masih hidup (beri waktu sebentar). */
+    const closeIfGone = (peerId: string) => {
+      const peer = peerMap.get(peerId);
+      if (!peer || present.has(peerId)) return;
+      if (!peer.connected) closePeer(peerId);
+      else
+        later(() => {
+          if (!present.has(peerId)) closePeer(peerId);
+        }, LEAVE_GRACE_MS);
+    };
+
+    const setupDataChannel = (peer: Peer, dc: RTCDataChannel) => {
+      dc.binaryType = "arraybuffer";
+      peer.dc = dc;
+      const receiver = createReceiver((index, blob) => handlersRef.current.onPhoto(peer.id, index, blob));
+
+      const onOpen = () => {
+        publish();
+        handlersRef.current.onChannelOpen(peer.id);
+      };
+      dc.onopen = onOpen;
+      dc.onclose = () => {
+        if (peer.dc !== dc) return;
+        peer.dc = null;
+        publish();
+        if (!present.has(peer.id)) closePeer(peer.id);
       };
       dc.onmessage = (event) => {
         if (typeof event.data === "string") {
-          const message = JSON.parse(event.data) as BoothMessage | PhotoMeta;
+          let message: BoothMessage | PhotoMeta;
+          try {
+            message = JSON.parse(event.data);
+          } catch {
+            return;
+          }
           if (message.type === "photo-meta") receiver.meta(message);
-          else handlersRef.current.onMessage(message);
+          else handlersRef.current.onMessage(peer.id, message);
         } else {
           receiver.chunk(event.data as ArrayBuffer);
         }
       };
-      if (dc.readyState === "open") setChannelOpen(true);
+      if (dc.readyState === "open") onOpen();
     };
 
-    const closePeer = () => {
-      if (pc) {
-        pc.onicecandidate = null;
-        pc.ontrack = null;
-        pc.onconnectionstatechange = null;
-        pc.ondatachannel = null;
-        pc.close();
+    const makeOffer = async (peer: Peer, iceRestart = false) => {
+      try {
+        const offer = await peer.pc.createOffer({ iceRestart });
+        if (peerMap.get(peer.id) !== peer) return;
+        await peer.pc.setLocalDescription(offer);
+        if (peerMap.get(peer.id) !== peer) return;
+        signal(peer.id, { type: "offer", sdp: peer.pc.localDescription!.toJSON() });
+      } catch (err) {
+        console.error("[offer]", err);
       }
-      pc = null;
-      peerId = null;
-      connected = false;
-      pendingRemote = [];
-      outgoing = [];
-      dcRef.current = null;
-      setChannelOpen(false);
-      setRemoteStream(null);
     };
 
-    const makeOffer = async (iceRestart = false) => {
-      const conn = pc;
-      if (!conn) return;
-      const offer = await conn.createOffer({ iceRestart });
-      if (conn !== pc) return;
-      await conn.setLocalDescription(offer);
-      signal({ type: "offer", sdp: conn.localDescription!.toJSON() });
-    };
-
-    const createPeer = (otherId: string) => {
-      closePeer();
-      peerId = otherId;
-      // Penentuan siapa yang membuat offer: id yang lebih kecil. Deterministik, jadi tidak ada tabrakan offer.
-      const initiator = myId < otherId;
-      setIsInitiator(initiator);
-      setStatus("connecting");
-
-      const conn = new RTCPeerConnection({ iceServers });
-      pc = conn;
+    const createPeer = (otherId: string): Peer => {
+      const pc = new RTCPeerConnection({ iceServers });
+      const peer: Peer = {
+        id: otherId,
+        pc,
+        // Deterministik, jadi tidak ada tabrakan offer di pasangan mana pun.
+        initiator: id < otherId,
+        dc: null,
+        pendingRemote: earlyCandidates.get(otherId) ?? [],
+        outgoing: [],
+        flushTimer: null,
+        stream: null,
+        connected: false,
+        seen: false,
+        sendQueue: Promise.resolve(),
+      };
+      earlyCandidates.delete(otherId);
+      peerMap.set(otherId, peer);
 
       const local = localRef.current;
-      local?.getTracks().forEach((track) => conn.addTrack(track, local));
+      local?.getTracks().forEach((track) => pc.addTrack(track, local));
 
-      conn.ontrack = (event) => {
-        setRemoteStream(event.streams[0] ?? new MediaStream([event.track]));
-      };
-      conn.onicecandidate = (event) => {
-        if (!event.candidate) return;
-        outgoing.push(event.candidate.toJSON());
-        if (!flushTimer) flushTimer = setTimeout(flushCandidates, 150);
-      };
-      conn.onconnectionstatechange = () => {
-        const state = conn.connectionState;
-        if (state === "connected") {
-          connected = true;
-          setStatus("connected");
-        } else if (state === "failed") {
-          connected = false;
-          setStatus("connecting");
-          if (initiator) void makeOffer(true); // coba ICE restart
-        } else if (state === "disconnected") {
-          setStatus("connecting");
+      pc.ontrack = (event) => {
+        const stream = event.streams[0];
+        if (stream) peer.stream = stream;
+        else {
+          peer.stream ??= new MediaStream();
+          peer.stream.addTrack(event.track);
         }
+        publish();
+      };
+      // Kandidat ICE dikumpulkan lalu dikirim per batch supaya tidak kena rate limit Realtime.
+      pc.onicecandidate = (event) => {
+        if (!event.candidate) return;
+        peer.outgoing.push(event.candidate.toJSON());
+        if (peer.flushTimer) return;
+        peer.flushTimer = setTimeout(() => {
+          peer.flushTimer = null;
+          if (peerMap.get(otherId) !== peer || peer.outgoing.length === 0) return;
+          signal(otherId, { type: "candidates", candidates: peer.outgoing });
+          peer.outgoing = [];
+        }, CANDIDATE_BATCH_MS);
+      };
+      pc.onconnectionstatechange = () => {
+        if (peerMap.get(otherId) !== peer) return;
+        const state = pc.connectionState;
+        if (state === "connected") {
+          peer.connected = true;
+          tuneVideo();
+        } else if (state === "failed") {
+          peer.connected = false;
+          if (!present.has(otherId)) return closePeer(otherId);
+          if (peer.initiator) void makeOffer(peer, true); // coba ICE restart
+        } else if (state === "disconnected" || state === "closed") {
+          peer.connected = false;
+          if (!present.has(otherId)) return closePeer(otherId);
+        }
+        publish();
       };
 
-      if (initiator) setupDataChannel(conn.createDataChannel("booth", { ordered: true }));
-      else conn.ondatachannel = (event) => setupDataChannel(event.channel);
+      if (peer.initiator) setupDataChannel(peer, pc.createDataChannel("booth", { ordered: true }));
+      else pc.ondatachannel = (event) => setupDataChannel(peer, event.channel);
 
-      return conn;
+      return peer;
     };
 
-    const drainCandidates = async () => {
-      const conn = pc;
-      if (!conn?.remoteDescription) return;
-      const list = pendingRemote;
-      pendingRemote = [];
+    const drainCandidates = async (peer: Peer) => {
+      if (!peer.pc.remoteDescription) return;
+      const list = peer.pendingRemote;
+      peer.pendingRemote = [];
       for (const candidate of list) {
         try {
-          await conn.addIceCandidate(candidate);
+          await peer.pc.addIceCandidate(candidate);
         } catch {
           /* kandidat usang, abaikan */
         }
@@ -190,38 +377,44 @@ export function usePeerRoom(roomId: string, handlers: Handlers) {
     };
 
     const onSignal = async (msg: SignalEnvelope) => {
-      if (msg.from === myId) return;
-      if (msg.to && msg.to !== myId) return;
-      // Jangan biarkan orang ketiga merusak sesi yang sudah tersambung.
-      if (connected && peerId && msg.from !== peerId) return;
+      if (!admitted || msg.from === id || msg.to !== id) return;
+      let peer = peerMap.get(msg.from);
 
       try {
         if (msg.type === "offer") {
-          if (!pc || peerId !== msg.from) {
-            const early = pendingRemote; // kandidat yang mungkin datang lebih dulu dari offer
-            createPeer(msg.from);
-            pendingRemote = early;
+          if (!peer) {
+            // Offer bisa datang sebelum presence pengirimnya terlihat di sini.
+            if (peerMap.size >= MAX_CAPACITY - 1) return;
+            peer = createPeer(msg.from);
+            publish();
           }
-          const conn = pc!;
-          await conn.setRemoteDescription(msg.sdp);
-          const answer = await conn.createAnswer();
-          await conn.setLocalDescription(answer);
-          signal({ type: "answer", sdp: conn.localDescription!.toJSON() });
-          await drainCandidates();
+          if (peer.initiator) return; // aku yang seharusnya membuat offer
+          await peer.pc.setRemoteDescription(msg.sdp);
+          const answer = await peer.pc.createAnswer();
+          await peer.pc.setLocalDescription(answer);
+          if (peerMap.get(msg.from) !== peer) return;
+          signal(msg.from, { type: "answer", sdp: peer.pc.localDescription!.toJSON() });
+          await drainCandidates(peer);
         } else if (msg.type === "answer") {
-          if (!pc || peerId !== msg.from || pc.signalingState !== "have-local-offer") return;
-          await pc.setRemoteDescription(msg.sdp);
-          await drainCandidates();
+          if (!peer?.initiator || peer.pc.signalingState !== "have-local-offer") return;
+          await peer.pc.setRemoteDescription(msg.sdp);
+          await drainCandidates(peer);
         } else if (msg.type === "candidates") {
-          if (peerId && peerId !== msg.from) return;
-          pendingRemote.push(...msg.candidates);
-          await drainCandidates();
+          if (!peer) {
+            const list = earlyCandidates.get(msg.from) ?? [];
+            if (list.length < 100) list.push(...msg.candidates);
+            earlyCandidates.set(msg.from, list);
+            return;
+          }
+          peer.pendingRemote.push(...msg.candidates);
+          await drainCandidates(peer);
         }
       } catch (err) {
         console.error("[signaling]", err);
       }
     };
 
+    // ── Presence & penerimaan anggota ───────────────────────────
     const leaveChannel = () => {
       if (!channel) return;
       const ch = channel;
@@ -229,60 +422,112 @@ export function usePeerRoom(roomId: string, handlers: Handlers) {
       void getSupabase().removeChannel(ch);
     };
 
-    const handlePresence = () => {
-      if (!channel) return;
+    const readPresence = (): PresenceMeta[] => {
+      if (!channel) return [];
       const state = channel.presenceState<PresenceMeta>();
       const byId = new Map<string, PresenceMeta>();
-      Object.values(state)
-        .flat()
-        .forEach((p) => byId.set(p.id, { id: p.id, joinedAt: p.joinedAt }));
-      const members = [...byId.values()].sort(
-        (a, b) => a.joinedAt - b.joinedAt || a.id.localeCompare(b.id),
-      );
+      for (const p of Object.values(state).flat()) {
+        if (typeof p.id !== "string") continue;
+        const prev = byId.get(p.id);
+        byId.set(p.id, {
+          id: p.id,
+          joinedAt: Number(p.joinedAt) || 0,
+          capacity: parseCapacity(p.capacity) ?? prev?.capacity,
+          // Status admitted bersifat permanen.
+          admitted: p.admitted === true || prev?.admitted === true,
+        });
+      }
+      return [...byId.values()].sort(byJoin);
+    };
 
-      // Sesi yang sudah tersambung dipertahankan selama pasangannya masih ada.
-      if (connected && peerId && byId.has(peerId)) return;
+    const becomeFull = (cap: number) => {
+      finished = true;
+      roomCapacity = cap;
+      setCapacity(cap);
+      setStage("full");
+      for (const peerId of [...peerMap.keys()]) closePeer(peerId);
+      leaveChannel();
+      localRef.current?.getTracks().forEach((t) => t.stop());
+    };
 
-      const myIndex = members.findIndex((m) => m.id === myId);
-      if (myIndex >= MAX_MEMBERS) {
-        closePeer();
-        leaveChannel();
-        setStatus("full");
+    /**
+     * Pendatang baru menghitung slot sisa = kapasitas − anggota lain yang sudah admitted.
+     * Pendatang yang bersamaan diurutkan berdasarkan joinedAt lalu id, jadi semua sepakat siapa yang masuk.
+     */
+    const tryAdmit = (all: PresenceMeta[]) => {
+      if (admitted || finished || !admitReady || !channel) return;
+      const others = all.filter((m) => m.id !== id);
+      const admittedOthers = others.filter((m) => m.admitted);
+      const cap =
+        admittedOthers.find((m) => m.capacity)?.capacity ??
+        capacityParam ??
+        others.find((m) => m.capacity)?.capacity ??
+        DEFAULT_CAPACITY;
+
+      const slots = cap - admittedOthers.length;
+      const pending = all.filter((m) => m.id === id || !m.admitted);
+      const rank = pending.findIndex((m) => m.id === id);
+      if (rank === -1) return; // presence-ku belum terlihat, tunggu sync berikutnya
+
+      if (rank >= slots) {
+        becomeFull(cap);
         return;
       }
+      admitted = true;
+      roomCapacity = cap;
+      setCapacity(cap);
+      setStage("admitted");
+      void channel.track({ id, joinedAt, capacity: cap, admitted: true } satisfies PresenceMeta);
+    };
 
-      const other = members.slice(0, MAX_MEMBERS).find((m) => m.id !== myId);
-      if (!other) {
-        if (pc) closePeer();
-        setStatus("waiting");
-        return;
+    const syncPeers = (all: PresenceMeta[]) => {
+      if (!admitted || finished) return;
+      const list = all.filter((m) => m.admitted && m.id !== id);
+      const ordered = [...list, { id, joinedAt }].sort(byJoin).map((m) => m.id);
+      const key = ordered.join(",");
+      if (key !== membersKey) {
+        membersKey = key;
+        setMembers(ordered);
       }
-      if (pc && peerId === other.id) return;
 
-      createPeer(other.id);
-      if (myId < other.id) void makeOffer();
+      if (roomCapacity !== 1) {
+        for (const m of list) {
+          const existing = peerMap.get(m.id);
+          if (existing) {
+            existing.seen = true;
+            continue;
+          }
+          const peer = createPeer(m.id);
+          peer.seen = true;
+          if (peer.initiator) void makeOffer(peer);
+        }
+      }
+      for (const peer of [...peerMap.values()]) if (peer.seen) closeIfGone(peer.id);
+      publish();
+      tuneVideo();
+    };
+
+    const handlePresence = () => {
+      if (!channel || finished) return;
+      const all = readPresence();
+      present = new Set(all.map((m) => m.id));
+      tryAdmit(all);
+      syncPeers(all);
     };
 
     (async () => {
       try {
-        setStatus("media");
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: "user",
-            width: { ideal: 1280 },
-            height: { ideal: 960 },
-            aspectRatio: { ideal: 4 / 3 },
-          },
-          audio: { echoCancellation: true, noiseSuppression: true },
-        });
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
+        setMyId(id);
+        setStage("media");
+        const stream = await openCamera(() => cancelled);
+        if (!stream || cancelled) {
+          stream?.getTracks().forEach((t) => t.stop());
           return;
         }
         localRef.current = stream;
         setLocalStream(stream);
 
-        setStatus("joining");
+        setStage("joining");
         try {
           const res = await fetch("/api/ice", { cache: "no-store" });
           const data = (await res.json()) as { iceServers?: RTCIceServer[] };
@@ -296,7 +541,7 @@ export function usePeerRoom(roomId: string, handlers: Handlers) {
         const ch = supabase.channel(`photobooth:${roomId}`, {
           config: {
             broadcast: { self: false },
-            presence: { key: myId },
+            presence: { key: id },
           },
         });
         channel = ch;
@@ -306,19 +551,28 @@ export function usePeerRoom(roomId: string, handlers: Handlers) {
         })
           .on("presence", { event: "sync" }, handlePresence)
           .subscribe(async (subStatus) => {
-            if (cancelled) return;
+            if (cancelled || finished) return;
             if (subStatus === "SUBSCRIBED") {
-              setStatus((s) => (s === "joining" ? "waiting" : s));
-              await ch.track({ id: myId, joinedAt: Date.now() } satisfies PresenceMeta);
+              const meta: PresenceMeta = admitted
+                ? { id, joinedAt, capacity: roomCapacity ?? undefined, admitted: true }
+                : { id, joinedAt, capacity: capacityParam ?? undefined, admitted: false };
+              await ch.track(meta);
+              if (!admitted && !admitReady) {
+                later(() => {
+                  admitReady = true;
+                  handlePresence();
+                }, ADMIT_DELAY_MS);
+              }
             } else if (subStatus === "CHANNEL_ERROR" || subStatus === "TIMED_OUT") {
+              if (admitted) return; // sudah masuk: koneksi peer tetap jalan, Realtime akan mencoba lagi
               setError("Gagal terhubung ke Supabase Realtime. Cek URL/key dan pengaturan Realtime.");
-              setStatus("error");
+              setStage("error");
             }
           });
       } catch (err) {
         if (cancelled) return;
         setError(describeMediaError(err));
-        setStatus("error");
+        setStage("error");
       }
     })();
 
@@ -329,29 +583,37 @@ export function usePeerRoom(roomId: string, handlers: Handlers) {
 
     return () => {
       cancelled = true;
+      finished = true;
       window.removeEventListener("pagehide", onPageHide);
-      if (flushTimer) clearTimeout(flushTimer);
-      closePeer();
+      timers.forEach(clearTimeout);
+      if (outboxTimer) clearTimeout(outboxTimer);
+      for (const peerId of [...peerMap.keys()]) closePeer(peerId);
       leaveChannel();
       localRef.current?.getTracks().forEach((t) => t.stop());
       localRef.current = null;
       setLocalStream(null);
     };
-  }, [roomId]);
+  }, [roomId, capacityParam]);
 
   const send = useCallback((message: BoothMessage) => {
-    const dc = dcRef.current;
+    const data = JSON.stringify(message);
+    for (const peer of peersRef.current.values()) {
+      if (peer.dc?.readyState === "open") peer.dc.send(data);
+    }
+  }, []);
+
+  const sendTo = useCallback((peerId: string, message: BoothMessage) => {
+    const dc = peersRef.current.get(peerId)?.dc;
     if (dc?.readyState === "open") dc.send(JSON.stringify(message));
   }, []);
 
-  /** Foto dikirim berurutan agar potongan data dua foto tidak tercampur. */
+  /** Foto dikirim ke semua teman; tiap data channel punya antreannya sendiri. */
   const sendPhoto = useCallback((index: number, blob: Blob) => {
-    sendQueueRef.current = sendQueueRef.current
-      .then(() => {
-        const dc = dcRef.current;
-        return dc ? sendBlob(dc, index, blob) : undefined;
-      })
-      .catch((err) => console.error("[sendPhoto]", err));
+    for (const peer of peersRef.current.values()) {
+      peer.sendQueue = peer.sendQueue
+        .then(() => (peer.dc ? sendBlob(peer.dc, index, blob) : undefined))
+        .catch((err) => console.error("[sendPhoto]", err));
+    }
   }, []);
 
   const toggleMic = useCallback(() => {
@@ -361,15 +623,26 @@ export function usePeerRoom(roomId: string, handlers: Handlers) {
     setMicOn(next);
   }, []);
 
+  const peerList = Object.values(peers);
+  let status: ConnectionStatus;
+  if (stage !== "admitted") status = stage;
+  else if (capacity === 1) status = "solo";
+  else if (members.length <= 1) status = "waiting";
+  else if (peerList.some((p) => p.connected)) status = "connected";
+  else status = "connecting";
+
   return {
     status,
     error,
+    myId,
+    capacity,
+    members,
+    peers,
+    openCount: peerList.filter((p) => p.channelOpen).length,
     localStream,
-    remoteStream,
-    isInitiator,
-    channelOpen,
     micOn,
     send,
+    sendTo,
     sendPhoto,
     toggleMic,
   };

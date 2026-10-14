@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type RefObject } from "react";
 
 type Props = {
   stream: MediaStream | null;
@@ -9,9 +9,10 @@ type Props = {
   filterCss: string;
   videoRef?: RefObject<HTMLVideoElement | null>;
   emptyText: string;
+  style?: CSSProperties;
 };
 
-export function VideoTile({ stream, label, muted = false, filterCss, videoRef, emptyText }: Props) {
+export function VideoTile({ stream, label, muted = false, filterCss, videoRef, emptyText, style }: Props) {
   const innerRef = useRef<HTMLVideoElement | null>(null);
   const ref = videoRef ?? innerRef;
   const [needsTap, setNeedsTap] = useState(false);
@@ -33,7 +34,7 @@ export function VideoTile({ stream, label, muted = false, filterCss, videoRef, e
   };
 
   return (
-    <div className="relative aspect-[4/3] overflow-hidden bg-ink/15">
+    <div className="relative aspect-[4/3] overflow-hidden bg-ink/15" style={style}>
       <video
         ref={ref}
         autoPlay

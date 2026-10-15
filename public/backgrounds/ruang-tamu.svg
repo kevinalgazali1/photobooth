@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="600" viewBox="0 0 1600 600">
+  <defs>
+    <linearGradient id="wall" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#EADBC8"/>
+      <stop offset="1" stop-color="#DCC7AE"/>
+    </linearGradient>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#BFDDF2"/>
+      <stop offset="1" stop-color="#EAF4F9"/>
+    </linearGradient>
+    <linearGradient id="sofa" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3F7F7A"/>
+      <stop offset="1" stop-color="#2C5F5B"/>
+    </linearGradient>
+    <radialGradient id="lampglow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFE9B0" stop-opacity="0.8"/>
+      <stop offset="1" stop-color="#FFE9B0" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1600" height="600" fill="url(#wall)"/>
+  <!-- jendela di tengah, melintasi sambungan dua foto -->
+  <rect x="640" y="40" width="320" height="250" rx="6" fill="#FFFFFF"/>
+  <rect x="652" y="52" width="296" height="226" fill="url(#sky)"/>
+  <path d="M652 230 Q720 190 790 225 Q860 195 948 232 L948 278 L652 278 Z" fill="#9CC79A"/>
+  <rect x="796" y="52" width="8" height="226" fill="#FFFFFF"/>
+  <rect x="652" y="161" width="296" height="8" fill="#FFFFFF"/>
+  <path d="M600 30 Q640 160 610 320 L560 320 Q590 160 560 30 Z" fill="#C9705A"/>
+  <path d="M1000 30 Q960 160 990 320 L1040 320 Q1010 160 1040 30 Z" fill="#C9705A"/>
+  <rect x="540" y="22" width="520" height="12" rx="6" fill="#7A5A44"/>
+  <!-- bingkai foto di kiri dan kanan -->
+  <rect x="120" y="80" width="150" height="190" fill="#7A5A44"/>
+  <rect x="134" y="94" width="122" height="162" fill="#F6C9D0"/>
+  <circle cx="195" cy="160" r="38" fill="#E58C8A"/>
+  <rect x="1330" y="100" width="190" height="140" fill="#7A5A44"/>
+  <rect x="1344" y="114" width="162" height="112" fill="#C9DCF6"/>
+  <path d="M1344 226 L1400 160 L1440 200 L1470 172 L1506 226 Z" fill="#5B7FB5"/>
+  <!-- lampu berdiri dan tanaman di tepi -->
+  <circle cx="60" cy="230" r="120" fill="url(#lampglow)"/>
+  <path d="M20 160 L100 160 L84 240 L36 240 Z" fill="#F2E3C6"/>
+  <rect x="56" y="240" width="8" height="360" fill="#5A4636"/>
+  <path d="M1540 600 L1530 470 L1580 470 L1570 600 Z" fill="#B5643F"/>
+  <path d="M1555 470 C1500 400 1480 350 1500 300 C1530 360 1550 400 1555 470 Z" fill="#4E8A4A"/>
+  <path d="M1555 470 C1600 390 1600 330 1580 280 C1560 350 1555 400 1555 470 Z" fill="#3F7A3C"/>
+  <!-- sandaran sofa di sepanjang bawah -->
+  <rect x="0" y="420" width="1600" height="180" rx="40" fill="url(#sofa)"/>
+  <rect x="0" y="420" width="1600" height="16" rx="8" fill="#5A9C96" opacity="0.6"/>
+  <path d="M533 440 L533 600 M1066 440 L1066 600" stroke="#24504C" stroke-width="6"/>
+</svg>

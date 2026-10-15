@@ -10,9 +10,11 @@ type Props = {
   videoRef?: RefObject<HTMLVideoElement | null>;
   emptyText: string;
   style?: CSSProperties;
+  /** Rasio lebar/tinggi tile, sama dengan sel di hasil foto. */
+  aspect?: number;
 };
 
-export function VideoTile({ stream, label, muted = false, filterCss, videoRef, emptyText, style }: Props) {
+export function VideoTile({ stream, label, muted = false, filterCss, videoRef, emptyText, style, aspect = 4 / 3 }: Props) {
   const innerRef = useRef<HTMLVideoElement | null>(null);
   const ref = videoRef ?? innerRef;
   const [needsTap, setNeedsTap] = useState(false);
@@ -34,7 +36,7 @@ export function VideoTile({ stream, label, muted = false, filterCss, videoRef, e
   };
 
   return (
-    <div className="relative aspect-[4/3] overflow-hidden bg-ink/15" style={style}>
+    <div className="relative overflow-hidden bg-ink/15" style={{ aspectRatio: aspect, ...style }}>
       <video
         ref={ref}
         autoPlay

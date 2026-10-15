@@ -30,22 +30,69 @@ Tanpa database. Video, suara, dan foto dikirim langsung antar browser (WebRTC). 
 3. **Mesh:** setiap pasangan anggota punya satu `RTCPeerConnection` + data channel. Yang id-nya lebih kecil membuat **offer**, jadi tidak ada tabrakan. Kandidat ICE dikirim per batch dan pesan signaling diberi jeda supaya burst 8 orang tidak kena rate limit Realtime.
 4. **Bandwidth:** setelah tersambung, bitrate video kirim dibatasi ≈ 1,5 Mbps ÷ jumlah teman (minimal 150 kbps, maksimal 1,2 Mbps), dan resolusi kirim dibagi dua untuk room ≥4 orang. Ini hanya memengaruhi video live; foto tetap diambil dari kamera lokal dalam resolusi penuh.
 5. Setelah tersambung, semua komunikasi lewat **data channel**:
-   - `settings`: bingkai, filter, jumlah foto, dan tulisan. Memakai aturan "yang terbaru menang" (`updatedAt`). Pengaturan dikirim ke setiap data channel yang baru terbuka, jadi pendatang baru langsung ikut sinkron;
-   - `start`: hitung mundur dimulai bersamaan, membawa `order` (urutan peserta) supaya semua orang menyusun strip dengan urutan yang sama;
+   - `settings`: bingkai, filter, jumlah foto, format hasil, dan tulisan. Hanya host yang mengirimnya, ke setiap data channel yang baru terbuka, jadi pendatang baru langsung ikut sinkron. Peserta juga bisa meminta ulang dengan pesan `sync`;
+   - `start` / `reset`: hanya dari host. `start` membawa `order` (urutan peserta) supaya semua orang menyusun hasil dengan urutan yang sama;
    - tiap browser memotret **kamera lokalnya sendiri** lalu mengirim fotonya ke semua teman dalam potongan 16 KB (antrean terpisah per data channel). Kalau foto seseorang tidak datang dalam 12 detik, slotnya diisi kotak kosong, lalu diganti begitu fotonya datang.
-6. Semua browser menyusun strip di `<canvas>` dengan urutan dan pengaturan yang sama, jadi hasilnya identik.
+6. Semua browser menyusun hasil di `<canvas>` dengan urutan dan pengaturan yang sama, jadi hasilnya identik.
 
-Room 1 orang tidak membuat koneksi peer sama sekali; tombol "Mulai foto" langsung aktif. Untuk room lebih dari 1 orang, tombol aktif begitu minimal satu teman tersambung. Yang ikut di strip adalah kamu dan teman yang sudah tersambung saat tombol ditekan.
+Room 1 orang tidak membuat koneksi peer sama sekali; tombol "Mulai foto" langsung aktif. Untuk room lebih dari 1 orang, tombol aktif begitu minimal satu teman tersambung. Yang ikut di foto adalah host dan teman yang sudah tersambung dengannya saat tombol ditekan.
 
-## Layout strip
+## Pembuat room (host)
 
-Satu jepretan = satu panel berisi N foto 4:3. Jumlah kolom per panel:
+Hanya pembuat room yang bisa mengubah bingkai, filter, jumlah foto, format, dan tulisan, serta menekan "Mulai foto" dan "Foto lagi". Peserta lain melihat ringkasan pengaturan (baca saja), tombol mikrofon, dan tombol unduh. Identitas host diverifikasi tanpa database, memakai Web Crypto (`src/lib/host.ts`):
 
-| Orang | 1 | 2 | 3 | 4 | 5–6 | 7–8 |
-|-------|---|---|---|---|-----|-----|
-| Kolom | 1 | 2 | 3 | 2 | 3   | 4   |
+1. Saat "Buat room baru", browser membuat pasangan kunci **ECDSA P-256**. Room id = 10 karakter pertama dari SHA-256(public key), memakai alfabet tanpa karakter mirip (tanpa `l 1 o 0 i`). Private key (JWK) disimpan di `localStorage` dengan kunci `host:<roomId>`, jadi host tetap host setelah refresh. Pengaturan terakhir host juga disimpan, supaya tidak kembali ke bawaan.
+2. Host menaruh `hostPublicKey` dan `hostProof` di presence. `hostProof` adalah tanda tangan atas `<roomId>:<peerId>:<joinedAt>`.
+3. Peserta menganggap seseorang host hanya bila hash public key-nya cocok dengan room id **dan** tanda tangannya valid untuk peerId orang itu. Klaim yang tidak valid diabaikan. Menyalin presence host tidak berguna karena tanda tangannya terikat ke peerId host.
+4. Pesan `settings`, `start`, dan `reset` hanya diproses bila datang dari data channel milik host terverifikasi. Pengirim ditentukan dari data channel asal pesan, bukan dari isi pesan.
+5. Satu kursi selalu disisakan untuk host, jadi host yang kembali tidak pernah mendapat "room penuh". Selama host tidak ada, peserta melihat "Pembuat room keluar. Sesi lanjut saat dia kembali." Host yang membuka tautan lagi di browser yang sama otomatis kembali menjadi host.
 
-Baris terakhir yang tidak penuh diletakkan di tengah. Panel ditumpuk ke bawah sesuai jumlah jepretan (1–4). Untuk N besar ukuran sel diperkecil supaya sisi terpanjang PNG ≤ ±4000 px. Tampilan kamera di booth memakai susunan kolom yang sama, dengan urutan tile yang sama di semua layar.
+Room dengan kode format lama (6 karakter, tanpa kunci) tetap bisa dibuka. Di room seperti itu semua orang memegang kendali, dan booth menampilkan pesan bahwa room dibuat dengan versi lama, lengkap dengan tombol membuat room baru.
+
+> Kunci host hanya ada di browser pembuatnya. Kalau pembuat room menghapus data situs atau pindah perangkat, room itu tidak punya host lagi. Buat room baru saja.
+
+## Layout hasil
+
+Satu jepretan = satu panel. Susunan panel berasal dari satu fungsi bersama `getLayout(n)` (`src/lib/layout.ts`) yang dipakai untuk tampilan kamera live **dan** canvas, jadi yang terlihat saat foto sama dengan hasilnya:
+
+| Orang | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|-------|---|---|---|---|---|---|---|---|
+| Grid | 1×1 | 2×1 | 3×1 | 2×2 | 3×2 | 3×2 | 4×2 | 4×2 |
+| Tile hiasan | 0 | 0 | 0 | 0 | 1 | 0 | 1 | 0 |
+
+- Rasio sel 4:3 untuk N ≤ 2 dan 1:1 untuk N ≥ 3 (crop tengah dari foto asli).
+- **2 orang: tanpa celah.** Kedua foto menempel (di hasil dan di tampilan live), jadi satu panel terlihat seperti satu ruangan. Paling terasa bila dipadukan dengan background pengganti.
+- Slot sisa di kanan bawah diisi **tile hiasan** dari bingkai terpilih: warna bingkai, caption, nomor jepretan ("2/3"), dan stiker bingkai bila ada. Tampilan live menampilkan tile yang sama.
+- Lebar sel di canvas minimal 520 px. PNG lebih baik membesar (sampai ±4800 px di sisi terpanjang) daripada fotonya mengecil.
+- **Format hasil** (diatur host): *Strip*, yaitu semua jepretan ditumpuk dalam satu gambar; atau *Per jepretan*, yaitu setiap jepretan menjadi gambar sendiri dengan bingkai lengkap. Di format Per jepretan ada tombol unduh per gambar dan tombol "Unduh semua" yang membuat ZIP di browser (`fflate`).
+- Bawaan mengikuti N, dan host tetap bisa mengubahnya:
+
+  | Orang | 1–2 | 3–4 | 5–8 |
+  |-------|-----|-----|-----|
+  | Jumlah jepretan | 4 | 3 | 2 |
+  | Format | Strip | Strip | Per jepretan |
+
+- Ukuran tile kamera live dihitung agar sebesar mungkin di lebar dan tinggi viewport, dan saat hitung mundur panggung digulir supaya semua tile terlihat tanpa scroll. Di HP portrait untuk N ≥ 5, tampilan live memakai 2 kolom; layout hasil tetap mengikuti tabel.
+
+## Background pengganti
+
+Host bisa memilih **Background** (Studio, Ruang tamu, Kafe, Pantai, Senja kota, atau Asli). Latar ruangan tiap orang diganti satu pemandangan yang membentang di seluruh area foto panel, jadi menyambung dari foto kiri ke kanan (jendela, untaian lampu, cakrawala, sofa, atau pagar balkon melintasi sambungan) dan semua orang terlihat berada di tempat yang sama.
+
+Cara kerjanya:
+
+1. Setiap orang memotret kamera lokalnya seperti biasa.
+2. Perangkat pemilik foto memisahkan orang dari latarnya dengan **segmentasi selfie MediaPipe** (`src/lib/segment.ts`), langsung di browser tanpa server. Tepinya dihaluskan, lalu hasilnya disimpan sebagai **masker** PNG (lebar 640 px, ±20–60 KB).
+3. Masker dikirim ke semua teman lewat data channel, sama seperti foto (`kind: "mask"`).
+4. Semua browser menyusun hasil dari foto + masker yang sama persis, jadi hasilnya tetap identik. Masker tidak dihitung ulang di tiap perangkat karena GPU yang berbeda bisa memberi hasil yang sedikit berbeda.
+
+Catatan:
+
+- Model (±250 KB) ada di `public/models/selfie_segmenter.tflite`. Runtime WASM (±12 MB) dimuat dari jsDelivr **hanya** saat background dipilih, dan mulai diunduh begitu host memilihnya supaya siap saat memotret. Versi di `TASKS_VISION_VERSION` (`src/lib/segment.ts`) harus sama dengan versi paket `@mediapipe/tasks-vision` di `package.json`.
+- Background bisa diganti di tahap review tanpa memotret ulang. Bila masker belum ada, perangkat masing-masing membuatnya saat itu juga.
+- Kalau masker seseorang tidak datang dalam 12 detik (mis. model gagal dimuat di HP lama), fotonya ditampilkan dengan latar asli, lalu diganti begitu maskernya datang.
+- Tampilan kamera live tetap menampilkan latar asli; penggantian background hanya pada hasil foto.
+
+Menambah background: simpan SVG/PNG/JPG rasio ±8:3 (dua foto 4:3 berdampingan) di `public/backgrounds/`, lalu daftarkan di `src/lib/backgrounds.ts`. Letakkan hal menarik di pinggir, atas, dan melintasi tengah; bagian tengah bawah tiap separuh akan tertutup badan. Untuk SVG, hindari teks.
 
 ## Batas realistis
 
@@ -59,28 +106,44 @@ Mesh berarti setiap orang mengirim video ke **setiap** teman. Dengan 8 orang, sa
 
 ```
 public/
-└── frames/                   # gambar/stiker bingkai (PNG/SVG transparan)
+├── backgrounds/              # pemandangan background pengganti (SVG 8:3)
+├── frames/                   # gambar/stiker bingkai (PNG/SVG transparan)
+└── models/                   # model segmentasi selfie MediaPipe
 src/
 ├── app/
 │   ├── page.tsx              # halaman depan: pilih jumlah orang, buat / masuk room
 │   ├── room/[id]/page.tsx    # halaman booth (?n= kapasitas)
 │   └── api/ice/route.ts      # daftar STUN/TURN (kredensial TURN tetap di server)
 ├── components/
-│   ├── Booth.tsx             # UI booth: grid kamera, hitung mundur, pengaturan, hasil
-│   ├── FramePicker.tsx       # pemilih bingkai dengan thumbnail strip asli
+│   ├── Booth.tsx             # UI booth: grid kamera, hitung mundur, pengaturan/ringkasan, hasil
+│   ├── DecorTile.tsx         # tile hiasan di grid live (digambar oleh fungsi canvas yang sama)
+│   ├── FramePicker.tsx       # pemilih bingkai dengan thumbnail hasil asli
+│   ├── ResultGallery.tsx     # tampilan hasil, unduh per gambar, "Unduh semua" (ZIP)
 │   ├── VideoTile.tsx
-│   ├── StartForm.tsx
+│   ├── StartForm.tsx         # pilih jumlah orang, buat room (+ kunci host), masuk room
 │   └── SampleStrip.tsx
 ├── hooks/
-│   └── usePeerRoom.ts        # presence + penerimaan anggota, signaling, mesh RTCPeerConnection
+│   ├── usePeerRoom.ts        # presence, penerimaan anggota, verifikasi host, mesh RTCPeerConnection
+│   └── useBoxSize.ts         # ukuran panggung + viewport untuk grid live
 └── lib/
     ├── supabase.ts           # client Supabase (Realtime saja)
+    ├── host.ts               # kunci host (ECDSA P-256), room id, verifikasi, penyaring pesan
+    ├── host.test.ts          # unit test verifikasi host (npm test)
+    ├── layout.ts             # getLayout(n) + bawaan jumlah jepretan & format
+    ├── backgrounds.ts        # daftar background pengganti
+    ├── segment.ts            # segmentasi orang → masker PNG (MediaPipe)
     ├── capture.ts            # ambil frame kamera → JPEG 4:3
     ├── frames.ts             # definisi bingkai
-    ├── strip.ts              # layout + gambar strip (pola, hiasan, stiker, filter) → PNG
-    ├── transfer.ts           # kirim/terima file lewat data channel
-    ├── room.ts               # kode room
+    ├── strip.ts              # gambar hasil (pola, hiasan, stiker, tile hiasan, filter) → PNG
+    ├── transfer.ts           # kirim/terima foto & masker lewat data channel
+    ├── room.ts               # normalisasi kode room
     └── types.ts
+```
+
+Unit test memakai test runner bawaan Node (tanpa dependency tambahan):
+
+```bash
+npm test
 ```
 
 ## Menjalankan di lokal
@@ -98,7 +161,7 @@ src/
    npm install
    npm run dev
    ```
-6. Buka `http://localhost:3000`, pilih jumlah orang, buat room, lalu buka tautan yang sama di beberapa tab (atau browser lain) untuk mencoba.
+6. Buka `http://localhost:3000`, pilih jumlah orang, buat room, lalu buka tautan yang sama di beberapa tab (atau browser lain) untuk mencoba. Tab yang membuat room menjadi host; tab lain menjadi peserta.
 
 > Kamera hanya bisa diakses lewat **HTTPS** atau `localhost`. Untuk mencoba dari HP, deploy dulu ke Vercel (lihat di bawah) lalu buka URL Vercel-nya.
 
@@ -152,7 +215,7 @@ Contohnya bingkai "Studio" yang memakai `public/frames/camera.svg`, `star.svg`, 
 ## Hal yang perlu diketahui
 
 - **Project Supabase gratis bisa di-pause** jika tidak dipakai beberapa waktu. Jika booth tiba-tiba gagal terhubung ke Supabase, cek dashboard dan aktifkan lagi project-nya.
-- **Kapasitas room ditentukan pembuatnya (1–8).** Orang yang datang setelah room penuh melihat pesan "room penuh". Anggota yang sudah masuk tidak akan tertendang oleh pendatang baru. Kalau ada yang keluar, kirim ulang tautannya untuk mengisi tempat yang kosong.
+- **Kapasitas room ditentukan pembuatnya (1–8).** Orang yang datang setelah room penuh melihat pesan "room penuh". Satu kursi selalu disisakan untuk host. Anggota yang sudah masuk tidak akan tertendang oleh pendatang baru. Kalau ada yang keluar, kirim ulang tautannya untuk mengisi tempat yang kosong.
 - **Tidak ada yang tersimpan.** Begitu tab ditutup, foto hilang. Pastikan menekan "Unduh strip".
 - **Kode room bersifat publik.** Siapa pun yang tahu kodenya bisa masuk selama room belum penuh. Kode acak 6 karakter cukup untuk pemakaian pribadi. Untuk produksi, pertimbangkan channel privat Supabase dengan token.
 - **Safari iOS:** suara teman kadang baru menyala setelah layar disentuh. Booth akan menampilkan tombol "Ketuk untuk menyalakan suara" bila itu terjadi.

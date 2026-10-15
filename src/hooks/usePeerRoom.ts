@@ -2,8 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RealtimeChannel } from "@supabase/supabase-js";
+import { isKeyedRoomId, loadHostKey, signHostProof, verifyHostClaim, type HostKey } from "@/lib/host";
 import { getSupabase } from "@/lib/supabase";
-import { createReceiver, sendBlob, type PhotoMeta } from "@/lib/transfer";
+import { createReceiver, sendBlob, type BlobKind, type PhotoMeta } from "@/lib/transfer";
 import {
   DEFAULT_CAPACITY,
   MAX_CAPACITY,
@@ -16,12 +17,22 @@ import {
 
 type Handlers = {
   onMessage: (from: string, message: BoothMessage) => void;
-  onPhoto: (from: string, index: number, blob: Blob) => void;
+  onPhoto: (from: string, index: number, blob: Blob, kind: BlobKind) => void;
   /** Data channel ke `peerId` baru terbuka (tempat yang pas untuk mengirim pengaturan). */
   onChannelOpen: (peerId: string) => void;
+  /** Kunci host termuat (browser ini pembuat room), sebelum masuk ke channel. */
+  onHostKey?: () => void;
 };
 
-type PresenceMeta = { id: string; joinedAt: number; capacity?: number; admitted: boolean };
+type PresenceMeta = {
+  id: string;
+  joinedAt: number;
+  capacity?: number;
+  admitted: boolean;
+  /** Hanya pada host: public key (JWK) dan tanda tangan atas `<roomId>:<id>:<joinedAt>`. */
+  hostPublicKey?: JsonWebKey;
+  hostProof?: string;
+};
 
 /** Ringkasan satu peer untuk UI. */
 export type PeerView = { id: string; stream: MediaStream | null; connected: boolean; channelOpen: boolean };
@@ -132,6 +143,11 @@ export function usePeerRoom(roomId: string, capacityParam: number | null, handle
   const [members, setMembers] = useState<string[]>([]);
   const [peers, setPeers] = useState<Record<string, PeerView>>({});
   const [micOn, setMicOn] = useState(true);
+  /** Browser ini memegang kunci host untuk room ini. */
+  const [amHost, setAmHost] = useState(false);
+  /** Peer id host terverifikasi yang sedang ada di room. */
+  const [hostId, setHostId] = useState<string | null>(null);
+  const [hostSeen, setHostSeen] = useState(false);
 
   const handlersRef = useRef(handlers);
   const peersRef = useRef<Map<string, Peer>>(new Map());
@@ -156,6 +172,12 @@ export function usePeerRoom(roomId: string, capacityParam: number | null, handle
     let roomCapacity: number | null = null;
     let present = new Set<string>();
     let membersKey = "";
+    const legacyRoom = !isKeyedRoomId(roomId);
+    let hostKey: HostKey | null = null;
+    let hostProof: string | null = null;
+    let currentHost: string | null = null;
+    /** Hasil verifikasi klaim host per (id, joinedAt, proof): true/false, null = sedang diperiksa. */
+    const hostChecks = new Map<string, boolean | null>();
     const earlyCandidates = new Map<string, RTCIceCandidateInit[]>();
     const timers = new Set<ReturnType<typeof setTimeout>>();
 
@@ -255,7 +277,7 @@ export function usePeerRoom(roomId: string, capacityParam: number | null, handle
     const setupDataChannel = (peer: Peer, dc: RTCDataChannel) => {
       dc.binaryType = "arraybuffer";
       peer.dc = dc;
-      const receiver = createReceiver((index, blob) => handlersRef.current.onPhoto(peer.id, index, blob));
+      const receiver = createReceiver((index, blob, kind) => handlersRef.current.onPhoto(peer.id, index, blob, kind));
 
       const onOpen = () => {
         publish();
@@ -435,9 +457,48 @@ export function usePeerRoom(roomId: string, capacityParam: number | null, handle
           capacity: parseCapacity(p.capacity) ?? prev?.capacity,
           // Status admitted bersifat permanen.
           admitted: p.admitted === true || prev?.admitted === true,
+          hostPublicKey: p.hostPublicKey ?? prev?.hostPublicKey,
+          hostProof: p.hostProof ?? prev?.hostProof,
         });
       }
       return [...byId.values()].sort(byJoin);
+    };
+
+    /** Metadata presence-ku; host menambahkan public key + bukti tanda tangan. */
+    const myMeta = (isAdmitted: boolean, cap: number | null): PresenceMeta => ({
+      id,
+      joinedAt,
+      capacity: cap ?? undefined,
+      admitted: isAdmitted,
+      ...(hostKey && hostProof ? { hostPublicKey: hostKey.publicJwk, hostProof } : {}),
+    });
+
+    /**
+     * Status klaim host seseorang: true = terverifikasi, false = bukan host / klaim palsu,
+     * null = sedang diverifikasi (hasilnya memicu handlePresence lagi).
+     */
+    const hostStatus = (m: PresenceMeta): boolean | null => {
+      if (legacyRoom || !m.hostProof) return false;
+      const key = `${m.id}|${m.joinedAt}|${m.hostProof}`;
+      if (!hostChecks.has(key)) {
+        hostChecks.set(key, null);
+        void verifyHostClaim(roomId, m).then((ok) => {
+          hostChecks.set(key, ok);
+          if (!ok) console.warn("[host] klaim host tidak valid diabaikan", m.id);
+          handlePresence();
+        });
+      }
+      return hostChecks.get(key) ?? null;
+    };
+
+    /** Host = anggota terverifikasi yang paling baru masuk (host yang refresh langsung mengambil alih). */
+    const updateHost = (all: PresenceMeta[]) => {
+      const verified = all.filter((m) => hostStatus(m) === true);
+      const next = verified.length ? verified[verified.length - 1].id : null;
+      if (next === currentHost) return;
+      currentHost = next;
+      setHostId(next);
+      if (next) setHostSeen(true);
     };
 
     const becomeFull = (cap: number) => {
@@ -453,6 +514,7 @@ export function usePeerRoom(roomId: string, capacityParam: number | null, handle
     /**
      * Pendatang baru menghitung slot sisa = kapasitas − anggota lain yang sudah admitted.
      * Pendatang yang bersamaan diurutkan berdasarkan joinedAt lalu id, jadi semua sepakat siapa yang masuk.
+     * Di room berkunci satu kursi selalu disisakan untuk host, jadi host yang kembali tidak pernah ditolak.
      */
     const tryAdmit = (all: PresenceMeta[]) => {
       if (admitted || finished || !admitReady || !channel) return;
@@ -464,20 +526,24 @@ export function usePeerRoom(roomId: string, capacityParam: number | null, handle
         others.find((m) => m.capacity)?.capacity ??
         DEFAULT_CAPACITY;
 
-      const slots = cap - admittedOthers.length;
-      const pending = all.filter((m) => m.id === id || !m.admitted);
-      const rank = pending.findIndex((m) => m.id === id);
-      if (rank === -1) return; // presence-ku belum terlihat, tunggu sync berikutnya
-
-      if (rank >= slots) {
-        becomeFull(cap);
-        return;
+      if (!hostKey) {
+        // Klaim yang masih diverifikasi dihitung sebagai host (paling lama beberapa milidetik).
+        const isHostLike = (m: PresenceMeta) => hostStatus(m) !== false;
+        const reserved = legacyRoom ? 0 : 1;
+        const slots = cap - reserved - admittedOthers.filter((m) => !isHostLike(m)).length;
+        const pending = all.filter((m) => m.id === id || (!m.admitted && !isHostLike(m)));
+        const rank = pending.findIndex((m) => m.id === id);
+        if (rank === -1) return; // presence-ku belum terlihat, tunggu sync berikutnya
+        if (rank >= slots) {
+          becomeFull(cap);
+          return;
+        }
       }
       admitted = true;
       roomCapacity = cap;
       setCapacity(cap);
       setStage("admitted");
-      void channel.track({ id, joinedAt, capacity: cap, admitted: true } satisfies PresenceMeta);
+      void channel.track(myMeta(true, cap));
     };
 
     const syncPeers = (all: PresenceMeta[]) => {
@@ -511,6 +577,7 @@ export function usePeerRoom(roomId: string, capacityParam: number | null, handle
       if (!channel || finished) return;
       const all = readPresence();
       present = new Set(all.map((m) => m.id));
+      updateHost(all);
       tryAdmit(all);
       syncPeers(all);
     };
@@ -537,6 +604,13 @@ export function usePeerRoom(roomId: string, capacityParam: number | null, handle
         }
         if (cancelled) return;
 
+        // Browser pembuat room menyimpan kunci host di localStorage, jadi tetap host setelah refresh.
+        hostKey = await loadHostKey(roomId);
+        if (hostKey) hostProof = await signHostProof(hostKey, roomId, id, joinedAt);
+        if (cancelled) return;
+        setAmHost(!!hostKey);
+        if (hostKey) handlersRef.current.onHostKey?.();
+
         const supabase = getSupabase();
         const ch = supabase.channel(`photobooth:${roomId}`, {
           config: {
@@ -553,10 +627,7 @@ export function usePeerRoom(roomId: string, capacityParam: number | null, handle
           .subscribe(async (subStatus) => {
             if (cancelled || finished) return;
             if (subStatus === "SUBSCRIBED") {
-              const meta: PresenceMeta = admitted
-                ? { id, joinedAt, capacity: roomCapacity ?? undefined, admitted: true }
-                : { id, joinedAt, capacity: capacityParam ?? undefined, admitted: false };
-              await ch.track(meta);
+              await ch.track(admitted ? myMeta(true, roomCapacity) : myMeta(false, capacityParam));
               if (!admitted && !admitReady) {
                 later(() => {
                   admitReady = true;
@@ -607,11 +678,11 @@ export function usePeerRoom(roomId: string, capacityParam: number | null, handle
     if (dc?.readyState === "open") dc.send(JSON.stringify(message));
   }, []);
 
-  /** Foto dikirim ke semua teman; tiap data channel punya antreannya sendiri. */
-  const sendPhoto = useCallback((index: number, blob: Blob) => {
+  /** Foto (atau maskernya) dikirim ke semua teman; tiap data channel punya antreannya sendiri. */
+  const sendPhoto = useCallback((index: number, blob: Blob, kind: BlobKind = "photo") => {
     for (const peer of peersRef.current.values()) {
       peer.sendQueue = peer.sendQueue
-        .then(() => (peer.dc ? sendBlob(peer.dc, index, blob) : undefined))
+        .then(() => (peer.dc ? sendBlob(peer.dc, index, blob, kind) : undefined))
         .catch((err) => console.error("[sendPhoto]", err));
     }
   }, []);
@@ -637,6 +708,11 @@ export function usePeerRoom(roomId: string, capacityParam: number | null, handle
     myId,
     capacity,
     members,
+    /** Room format lama (tanpa kunci host): semua orang memegang kendali. */
+    legacyRoom: !isKeyedRoomId(roomId),
+    amHost,
+    hostId,
+    hostSeen,
     peers,
     openCount: peerList.filter((p) => p.channelOpen).length,
     localStream,

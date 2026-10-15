@@ -1,4 +1,6 @@
 import { getFrame, type FrameDef, type FrameSticker } from "./frames";
+import { getBackground } from "./backgrounds";
+import { getLayout } from "./layout";
 import type { FilterId, FrameId } from "./types";
 
 export const FILTERS: Record<FilterId, { label: string; css: string }> = {
@@ -8,22 +10,16 @@ export const FILTERS: Record<FilterId, { label: string; css: string }> = {
   warm: { label: "Hangat", css: "saturate(1.2) brightness(1.04)" },
 };
 
-// Ukuran dasar (skala 1). Untuk N besar semuanya diperkecil supaya sisi terpanjang PNG ≤ MAX_SIDE.
+// Ukuran dasar (skala 1). Lebar sel = 600 px; tinggi mengikuti rasio dari getLayout (4:3 atau 1:1).
 const CELL_W = 600;
-const CELL_H = 450;
 const PAD = 48;
 const GAP = 20;
 const PANEL_GAP = 36;
 const FOOTER = 180;
-const MAX_SIDE = 4000;
-
-/** Jumlah kolom dalam satu panel untuk N orang. Dipakai juga oleh grid kamera. */
-export function columnsFor(people: number): number {
-  if (people <= 3) return Math.max(1, people);
-  if (people === 4) return 2;
-  if (people <= 6) return 3;
-  return 4;
-}
+/** Sisi terpanjang PNG sebelum mulai diperkecil. */
+const MAX_SIDE = 4800;
+/** Sel tidak pernah lebih kecil dari ini: lebih baik PNG membesar daripada foto mengecil. */
+const MIN_CELL_W = 520;
 
 type Rect = { x: number; y: number; w: number; h: number };
 
@@ -37,38 +33,48 @@ export type StripLayout = {
   footerHeight: number;
   /** cells[jepretan][orang] */
   cells: Rect[][];
+  /** decorCells[jepretan][i]: tile hiasan di slot sisa (kanan bawah). */
+  decorCells: Rect[][];
+  /** panels[jepretan]: seluruh area foto satu panel (tempat background pengganti dibentangkan). */
+  panels: Rect[];
 };
 
 export function stripLayout(people: number, shots: number, frame: FrameDef, scale = 1): StripLayout {
   const n = Math.max(1, people);
-  const cols = columnsFor(n);
-  const rows = Math.ceil(n / cols);
+  const { cols, rows, aspect, slots, seamless } = getLayout(n);
+  const cellH = CELL_W / aspect;
   const pad = frame.padding ?? PAD;
+  // Untuk 2 orang kedua foto menempel tanpa celah, seperti berada di satu ruangan.
+  const gap = seamless ? 0 : GAP;
 
-  const contentW = cols * CELL_W + (cols - 1) * GAP;
-  const panelH = rows * CELL_H + (rows - 1) * GAP;
+  const contentW = cols * CELL_W + (cols - 1) * gap;
+  const panelH = rows * cellH + (rows - 1) * gap;
   const baseW = pad * 2 + contentW;
   const baseH = pad + shots * panelH + (shots - 1) * PANEL_GAP + FOOTER;
 
-  const unit = Math.min(1, MAX_SIDE / Math.max(baseW, baseH)) * scale;
+  const fit = Math.max(MIN_CELL_W / CELL_W, Math.min(1, MAX_SIDE / Math.max(baseW, baseH)));
+  const unit = fit * scale;
   const u = (v: number) => Math.round(v * unit);
 
   const cells: Rect[][] = [];
+  const decorCells: Rect[][] = [];
+  const panels: Rect[] = [];
   for (let shot = 0; shot < shots; shot++) {
     const panelTop = pad + shot * (panelH + PANEL_GAP);
-    const row: Rect[] = [];
-    for (let p = 0; p < n; p++) {
-      const r = Math.floor(p / cols);
-      const c = p % cols;
-      // Baris terakhir yang tidak penuh diletakkan di tengah.
-      const inRow = Math.min(cols, n - r * cols);
-      const rowW = inRow * CELL_W + (inRow - 1) * GAP;
-      const x0 = pad + (contentW - rowW) / 2;
-      const x = u(x0 + c * (CELL_W + GAP));
-      const y = u(panelTop + r * (CELL_H + GAP));
-      row.push({ x, y, w: u(x0 + c * (CELL_W + GAP) + CELL_W) - x, h: u(panelTop + r * (CELL_H + GAP) + CELL_H) - y });
+    const people: Rect[] = [];
+    const decor: Rect[] = [];
+    // Slot diisi dari kiri atas; tidak ada baris yang digeser ke tengah.
+    for (let slot = 0; slot < slots; slot++) {
+      const x0 = pad + (slot % cols) * (CELL_W + gap);
+      const y0 = panelTop + Math.floor(slot / cols) * (cellH + gap);
+      const x = u(x0);
+      const y = u(y0);
+      const rect = { x, y, w: u(x0 + CELL_W) - x, h: u(y0 + cellH) - y };
+      (slot < n ? people : decor).push(rect);
     }
-    cells.push(row);
+    cells.push(people);
+    decorCells.push(decor);
+    panels.push({ x: u(pad), y: u(panelTop), w: u(pad + contentW) - u(pad), h: u(panelTop + panelH) - u(panelTop) });
   }
 
   return {
@@ -79,6 +85,8 @@ export function stripLayout(people: number, shots: number, frame: FrameDef, scal
     footerTop: u(baseH - FOOTER),
     footerHeight: u(baseH) - u(baseH - FOOTER),
     cells,
+    decorCells,
+    panels,
   };
 }
 
@@ -98,21 +106,21 @@ function loadImage(blob: Blob): Promise<HTMLImageElement> {
   });
 }
 
-const stickerCache = new Map<string, Promise<HTMLImageElement | null>>();
+const assetCache = new Map<string, Promise<HTMLImageElement | null>>();
 
-function loadSticker(src: string): Promise<HTMLImageElement | null> {
-  let cached = stickerCache.get(src);
+function loadAsset(src: string): Promise<HTMLImageElement | null> {
+  let cached = assetCache.get(src);
   if (!cached) {
     cached = new Promise((resolve) => {
       const img = new Image();
       img.onload = () => resolve(img);
       img.onerror = () => {
-        stickerCache.delete(src); // coba lagi lain kali
+        assetCache.delete(src); // coba lagi lain kali
         resolve(null);
       };
       img.src = src;
     });
-    stickerCache.set(src, cached);
+    assetCache.set(src, cached);
   }
   return cached;
 }
@@ -163,11 +171,18 @@ function readFontVar(name: string, fallback: string) {
 
 // ── Pola latar ───────────────────────────────────────────────────
 
-function drawPattern(ctx: CanvasRenderingContext2D, frame: FrameDef, w: number, h: number, unit: number) {
+function drawPattern(
+  ctx: CanvasRenderingContext2D,
+  frame: FrameDef,
+  w: number,
+  h: number,
+  unit: number,
+  color = frame.fg,
+) {
   if (!frame.pattern) return;
   ctx.save();
-  ctx.fillStyle = frame.fg;
-  ctx.strokeStyle = frame.fg;
+  ctx.fillStyle = color;
+  ctx.strokeStyle = color;
 
   if (frame.pattern === "dots") {
     const step = 28 * unit;
@@ -325,7 +340,7 @@ async function placeStickers(frame: FrameDef, layout: StripLayout): Promise<Plac
   const inset = pad * 0.12;
   const result: PlacedSticker[] = [];
   for (const sticker of frame.stickers) {
-    const img = await loadSticker(sticker.src);
+    const img = await loadAsset(sticker.src);
     if (!img || !img.naturalWidth || !img.naturalHeight) continue;
     const ratio = img.naturalWidth / img.naturalHeight;
     const size = sticker.size * unit;
@@ -350,6 +365,115 @@ async function placeStickers(frame: FrameDef, layout: StripLayout): Promise<Plac
   return result;
 }
 
+// ── Tile hiasan (slot kosong di kanan bawah panel) ──────────────────
+
+function fonts() {
+  return {
+    display: readFontVar("--font-display", "Impact, sans-serif"),
+    body: readFontVar("--font-body", "system-ui, sans-serif"),
+  };
+}
+
+async function ensureFonts(...specs: string[]) {
+  try {
+    await Promise.all(specs.map((s) => document.fonts?.load(s)));
+  } catch {
+    /* pakai font cadangan */
+  }
+}
+
+/**
+ * Tile hiasan: warna bingkai dibalik (latar = fg), pola bingkai, caption, nomor jepretan ("2/3"),
+ * dan stiker bingkai (atau bentuk hiasan bila tidak ada stiker).
+ * Dipakai oleh canvas strip dan oleh tile di tampilan kamera live, jadi tampilannya sama persis.
+ */
+async function drawDecorTile(
+  ctx: CanvasRenderingContext2D,
+  frame: FrameDef,
+  rect: Rect,
+  caption: string,
+  label: string,
+) {
+  const { x, y, w, h } = rect;
+  const s = Math.min(w, h) / CELL_W; // skala terhadap sel penuh 600 px
+  const { display, body } = fonts();
+  const captionSize = 118 * s;
+  const captionFont = `900 ${captionSize}px ${display}`;
+  const labelFont = `700 ${44 * s}px ${body}`;
+  await ensureFonts(captionFont, labelFont);
+  const stickers = await Promise.all((frame.stickers ?? []).slice(0, 2).map((st) => loadAsset(st.src)));
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
+  ctx.fillStyle = frame.fg;
+  ctx.fillRect(x, y, w, h);
+
+  ctx.translate(x, y);
+  drawPattern(ctx, frame, w, h, s, frame.bg);
+
+  // bingkai tipis di dalam tile
+  const inset = 22 * s;
+  ctx.strokeStyle = frame.bg;
+  ctx.globalAlpha = 0.55;
+  ctx.lineWidth = Math.max(1, 4 * s);
+  ctx.strokeRect(inset, inset, w - inset * 2, h - inset * 2);
+  ctx.globalAlpha = 1;
+
+  // stiker di pojok kiri atas & kanan bawah, atau bentuk hiasan di keempat pojok
+  const corner = Math.min(w, h) * 0.3;
+  const loaded = stickers.filter((img): img is HTMLImageElement => !!img && img.naturalWidth > 0);
+  if (loaded.length) {
+    loaded.forEach((img, i) => {
+      const ratio = img.naturalWidth / img.naturalHeight;
+      const iw = ratio >= 1 ? corner : corner * ratio;
+      const ih = ratio >= 1 ? corner / ratio : corner;
+      const px = i === 0 ? inset * 1.6 : w - inset * 1.6 - iw;
+      const py = i === 0 ? inset * 1.6 : h - inset * 1.6 - ih;
+      ctx.drawImage(img, px, py, iw, ih);
+    });
+  } else if (frame.decor) {
+    const shape = shapePath(frame.decor);
+    const r = 26 * s;
+    const points: [number, number, number][] = [
+      [inset + r * 2, inset + r * 2, -0.3],
+      [w - inset - r * 2, inset + r * 2, 0.25],
+      [inset + r * 2, h - inset - r * 2, 0.2],
+      [w - inset - r * 2, h - inset - r * 2, -0.25],
+    ];
+    ctx.fillStyle = frame.bg;
+    ctx.globalAlpha = 0.8;
+    for (const [px, py, rot] of points) {
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(rot);
+      ctx.scale(r, r);
+      ctx.fill(shape);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.fillStyle = frame.bg;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  ctx.font = captionFont;
+  ctx.fillText(caption.trim() || "kita", w / 2, h / 2 + captionSize * 0.3, w - inset * 4);
+  ctx.font = labelFont;
+  ctx.globalAlpha = 0.85;
+  ctx.fillText(label, w / 2, h / 2 + captionSize * 0.3 + 70 * s, w - inset * 4);
+  ctx.restore();
+}
+
+/** Menggambar tile hiasan ke canvas milik tampilan live (ukuran canvas sudah diatur pemanggil). */
+export async function paintDecorTile(canvas: HTMLCanvasElement, frameId: FrameId, caption: string, label: string) {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  await drawDecorTile(ctx, getFrame(frameId), { x: 0, y: 0, w: canvas.width, h: canvas.height }, caption, label);
+}
+
 // ── Susun strip ──────────────────────────────────────────────────
 
 export type StripInput = {
@@ -365,7 +489,46 @@ export type StripInput = {
   date?: Date;
   /** Skala tambahan, mis. 0.08 untuk thumbnail. */
   scale?: number;
+  /** Untuk format per jepretan: nomor jepretan pertama di gambar ini (0-based) dan total jepretan sesi. */
+  shotOffset?: number;
+  totalShots?: number;
+  /** Id background pengganti (`src/lib/backgrounds.ts`), atau "none". */
+  background?: string;
+  /** masks[orang][jepretan]: masker orang (PNG alpha) untuk background pengganti. */
+  masks?: (Blob | null | undefined)[][];
 };
+
+/**
+ * Orang dipotong dari fotonya memakai masker, lalu diletakkan di depan potongan background.
+ * Background dibentangkan di seluruh area foto panel, jadi menyambung dari sel ke sel.
+ */
+function drawWithBackground(
+  ctx: CanvasRenderingContext2D,
+  photo: HTMLImageElement,
+  mask: HTMLImageElement,
+  scene: HTMLImageElement,
+  cell: Rect,
+  panel: Rect,
+) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(cell.x, cell.y, cell.w, cell.h);
+  ctx.clip();
+  drawCover(ctx, scene, panel.x, panel.y, panel.w, panel.h);
+  ctx.restore();
+
+  const layer = document.createElement("canvas");
+  layer.width = cell.w;
+  layer.height = cell.h;
+  const lctx = layer.getContext("2d");
+  if (!lctx) return;
+  drawCover(lctx, photo, 0, 0, cell.w, cell.h);
+  // Masker punya rasio yang sama dengan foto, jadi crop "cover"-nya juga sama.
+  lctx.globalCompositeOperation = "destination-in";
+  lctx.imageSmoothingQuality = "high";
+  drawCover(lctx, mask, 0, 0, cell.w, cell.h);
+  ctx.drawImage(layer, cell.x, cell.y);
+}
 
 export async function renderStrip(input: StripInput): Promise<HTMLCanvasElement> {
   const frame = getFrame(input.frame);
@@ -394,10 +557,12 @@ export async function renderStrip(input: StripInput): Promise<HTMLCanvasElement>
     w: width * 0.6,
     h: 140 * unit,
   };
-  drawDecor(ctx, frame, layout, [...layout.cells.flat(), captionBox, ...stickers]);
+  drawDecor(ctx, frame, layout, [...layout.cells.flat(), ...layout.decorCells.flat(), captionBox, ...stickers]);
   for (const s of stickers) ctx.drawImage(s.img, s.x, s.y, s.w, s.h);
 
-  // 4. foto
+  // 4. foto (dengan background pengganti bila dipilih dan masker orangnya sudah ada)
+  const background = getBackground(input.background);
+  const scene = background ? await loadAsset(background.src) : null;
   for (let shot = 0; shot < layout.cells.length; shot++) {
     const row = layout.cells[shot];
     for (let person = 0; person < row.length; person++) {
@@ -406,7 +571,11 @@ export async function renderStrip(input: StripInput): Promise<HTMLCanvasElement>
       if (blob) {
         try {
           const img = await loadImage(blob);
-          drawCover(ctx, img, x, y, w, h);
+          const maskBlob = input.masks?.[person]?.[shot];
+          const mask = scene && maskBlob ? await loadImage(maskBlob).catch(() => null) : null;
+          if (scene && mask) drawWithBackground(ctx, img, mask, scene, row[person], layout.panels[shot]);
+          else drawCover(ctx, img, x, y, w, h);
+          // Filter diterapkan ke orang + latar sekaligus, jadi warnanya menyatu.
           applyFilter(ctx, x, y, w, h, input.filter);
           continue;
         } catch {
@@ -422,16 +591,18 @@ export async function renderStrip(input: StripInput): Promise<HTMLCanvasElement>
     }
   }
 
+  // 4b. tile hiasan di slot sisa
+  const totalShots = input.totalShots ?? input.shots;
+  for (let shot = 0; shot < layout.decorCells.length; shot++) {
+    const label = `${(input.shotOffset ?? 0) + shot + 1}/${totalShots}`;
+    for (const rect of layout.decorCells[shot]) await drawDecorTile(ctx, frame, rect, input.caption, label);
+  }
+
   // 5. tulisan dan tanggal
-  const display = readFontVar("--font-display", "Impact, sans-serif");
-  const body = readFontVar("--font-body", "system-ui, sans-serif");
+  const { display, body } = fonts();
   const captionFont = `900 ${76 * unit}px ${display}`;
   const dateFont = `500 ${28 * unit}px ${body}`;
-  try {
-    await Promise.all([document.fonts?.load(captionFont), document.fonts?.load(dateFont)]);
-  } catch {
-    /* pakai font cadangan */
-  }
+  await ensureFonts(captionFont, dateFont);
 
   const footerStickers = stickers.filter((s) => s.anchor.startsWith("footer"));
   const reserved = footerStickers.reduce((m, s) => Math.max(m, s.w), 0);

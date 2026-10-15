@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="600" viewBox="0 0 1600 600">
+  <defs>
+    <pattern id="bata" width="120" height="60" patternUnits="userSpaceOnUse">
+      <rect width="120" height="60" fill="#8E4B36"/>
+      <rect x="2" y="2" width="116" height="26" rx="3" fill="#A65A41"/>
+      <rect x="-58" y="32" width="116" height="26" rx="3" fill="#9C543C"/>
+      <rect x="62" y="32" width="116" height="26" rx="3" fill="#9C543C"/>
+    </pattern>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFD98A" stop-opacity="0.9"/>
+      <stop offset="0.35" stop-color="#FFD98A" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#FFD98A" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="shade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#000000" stop-opacity="0.25"/>
+      <stop offset="0.5" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0.35"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="600" fill="url(#bata)"/>
+  <rect width="1600" height="600" fill="url(#shade)"/>
+  <!-- papan menu kosong di kiri -->
+  <rect x="70" y="120" width="210" height="270" rx="8" fill="#5A3A26"/>
+  <rect x="84" y="134" width="182" height="242" rx="4" fill="#2B2E2A"/>
+  <path d="M110 180 H240 M110 220 H210 M110 260 H230 M110 300 H190 M110 340 H220" stroke="#E8E4D8" stroke-opacity="0.55" stroke-width="6" stroke-linecap="round"/>
+  <!-- rak dengan cangkir di kanan -->
+  <rect x="1300" y="250" width="250" height="14" fill="#5A3A26"/>
+  <path d="M1320 250 v-50 h44 v50 Z M1384 250 v-62 h40 v62 Z M1446 250 v-46 h50 v46 Z" fill="#F2E3C6"/>
+  <rect x="1300" y="370" width="250" height="14" fill="#5A3A26"/>
+  <path d="M1330 370 v-70 h30 v70 Z M1376 370 v-56 h46 v56 Z M1440 370 v-80 h28 v80 Z M1486 370 v-60 h40 v60 Z" fill="#3F7F7A"/>
+  <!-- untaian lampu melintasi kedua foto -->
+  <path d="M0 70 Q400 190 800 90 Q1200 -10 1600 110" fill="none" stroke="#2B1D14" stroke-width="5"/>
+  <circle cx="100" cy="102" r="60" fill="url(#glow)"/><circle cx="100" cy="102" r="11" fill="#FFE8A8"/>
+  <circle cx="260" cy="134" r="60" fill="url(#glow)"/><circle cx="260" cy="134" r="11" fill="#FFE8A8"/>
+  <circle cx="430" cy="140" r="60" fill="url(#glow)"/><circle cx="430" cy="140" r="11" fill="#FFE8A8"/>
+  <circle cx="610" cy="122" r="60" fill="url(#glow)"/><circle cx="610" cy="122" r="11" fill="#FFE8A8"/>
+  <circle cx="800" cy="90" r="60" fill="url(#glow)"/><circle cx="800" cy="90" r="11" fill="#FFE8A8"/>
+  <circle cx="990" cy="58" r="60" fill="url(#glow)"/><circle cx="990" cy="58" r="11" fill="#FFE8A8"/>
+  <circle cx="1170" cy="45" r="60" fill="url(#glow)"/><circle cx="1170" cy="45" r="11" fill="#FFE8A8"/>
+  <circle cx="1340" cy="57" r="60" fill="url(#glow)"/><circle cx="1340" cy="57" r="11" fill="#FFE8A8"/>
+  <circle cx="1500" cy="86" r="60" fill="url(#glow)"/><circle cx="1500" cy="86" r="11" fill="#FFE8A8"/>
+  <!-- meja kayu di bawah -->
+  <rect x="0" y="520" width="1600" height="80" fill="#6B4430"/>
+  <rect x="0" y="520" width="1600" height="10" fill="#8A5A3E"/>
+</svg>

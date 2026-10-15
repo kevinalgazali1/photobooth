@@ -2,7 +2,8 @@
 
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
-import { generateRoomCode, normalizeRoomCode } from "@/lib/room";
+import { createHostKey, saveHostKey } from "@/lib/host";
+import { normalizeRoomCode } from "@/lib/room";
 import { DEFAULT_CAPACITY, MAX_CAPACITY, MIN_CAPACITY, parseCapacity } from "@/lib/types";
 
 const SIZES = Array.from({ length: MAX_CAPACITY - MIN_CAPACITY + 1 }, (_, i) => MIN_CAPACITY + i);
@@ -12,10 +13,20 @@ export function StartForm() {
   const [people, setPeople] = useState(DEFAULT_CAPACITY);
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const createRoom = () => {
+  const createRoom = async () => {
     setBusy(true);
-    router.push(`/room/${generateRoomCode()}?n=${people}`);
+    setError(null);
+    try {
+      // Room id diturunkan dari public key host; private key disimpan di browser ini.
+      const { roomId, privateJwk } = await createHostKey();
+      saveHostKey(roomId, privateJwk);
+      router.push(`/room/${roomId}?n=${people}`);
+    } catch {
+      setError("Browser ini tidak bisa membuat kunci room. Buka lewat HTTPS atau localhost, lalu coba lagi.");
+      setBusy(false);
+    }
   };
 
   const joinRoom = (event: FormEvent) => {
@@ -61,6 +72,11 @@ export function StartForm() {
       >
         Buat room baru
       </button>
+      {error && (
+        <p role="alert" className="max-w-sm text-sm text-alert">
+          {error}
+        </p>
+      )}
 
       <form onSubmit={joinRoom} className="flex max-w-sm flex-col gap-2">
         <label htmlFor="room-code" className="text-sm text-paper/80">

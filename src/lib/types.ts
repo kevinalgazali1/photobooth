@@ -1,22 +1,32 @@
+import type { ResultFormat } from "./layout";
+
 /** Id bingkai, lihat `src/lib/frames.ts`. */
 export type FrameId = string;
 export type FilterId = "none" | "bw" | "vintage" | "warm";
 
+/** Pengaturan booth. Hanya host yang mengubahnya; peserta lain menerima salinannya. */
 export type BoothSettings = {
   frame: FrameId;
   filter: FilterId;
   shots: number;
   caption: string;
-  /** Waktu perubahan terakhir. Pengaturan dengan nilai lebih besar yang dipakai ("yang terbaru menang"). */
-  updatedAt: number;
+  /** "strip": semua jepretan dalam satu gambar. "single": satu gambar per jepretan. */
+  format: ResultFormat;
+  /** Background pengganti (`src/lib/backgrounds.ts`), atau "none" untuk latar asli. */
+  background: string;
 };
 
-/** Pesan aplikasi yang dikirim lewat data channel WebRTC. */
+/**
+ * Pesan aplikasi yang dikirim lewat data channel WebRTC.
+ * `settings`, `start`, dan `reset` hanya diproses bila datang dari data channel milik host terverifikasi.
+ */
 export type BoothMessage =
   | { type: "settings"; settings: BoothSettings }
   /** `order`: id peserta sesuai urutan di strip, sama untuk semua orang. */
   | { type: "start"; shots: number; order: string[] }
-  | { type: "reset" };
+  | { type: "reset" }
+  /** Peserta meminta host mengirim ulang pengaturan (mis. setelah host baru terverifikasi). */
+  | { type: "sync" };
 
 /** Pesan signaling yang dikirim lewat Supabase Realtime Broadcast. */
 export type SignalPayload =

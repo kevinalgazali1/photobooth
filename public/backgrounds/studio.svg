@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="600" viewBox="0 0 1600 600">
+  <defs>
+    <radialGradient id="back" cx="50%" cy="38%" r="75%">
+      <stop offset="0" stop-color="#F3ECE3"/>
+      <stop offset="0.55" stop-color="#D9CFC3"/>
+      <stop offset="1" stop-color="#A89C90"/>
+    </radialGradient>
+    <linearGradient id="floor" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#CBBFB2"/>
+      <stop offset="1" stop-color="#B3A698"/>
+    </linearGradient>
+    <radialGradient id="spot1" cx="25%" cy="45%" r="30%">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="spot2" cx="75%" cy="45%" r="30%">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1600" height="600" fill="url(#back)"/>
+  <path d="M0 470 Q800 430 1600 470 L1600 600 L0 600 Z" fill="url(#floor)"/>
+  <path d="M0 470 Q800 430 1600 470" fill="none" stroke="#FFFFFF" stroke-opacity="0.25" stroke-width="6"/>
+  <rect width="1600" height="600" fill="url(#spot1)"/>
+  <rect width="1600" height="600" fill="url(#spot2)"/>
+</svg>
